@@ -3,13 +3,15 @@ import os
 
 from aiogram import Bot, Dispatcher, executor, types
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-from dotenv import load_dotenv
+# from dotenv import load_dotenv  # можно вообще не использовать на Railway
 
-# Загружаем токен из .env
-load_dotenv()
+# Локально можешь оставить, но в проверке не упоминать .env
+# load_dotenv()
+
 API_TOKEN = os.getenv("BOT_TOKEN")
 if not API_TOKEN:
-    raise RuntimeError("Не найден BOT_TOKEN в .env")
+    raise RuntimeError("Не найден BOT_TOKEN в переменных окружения")
+
 
 # Confluence: раздел «ИБ в лицах» — название и ссылка (в .env: CONFLUENCE_IB_FACES_SECTION, CONFLUENCE_IB_FACES_URL)
 CONFLUENCE_IB_FACES_URL = os.getenv("CONFLUENCE_IB_FACES_URL", "").strip()
