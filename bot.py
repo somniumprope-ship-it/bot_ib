@@ -1,17 +1,18 @@
+import html
 import logging
 import os
 
+import access
 from aiogram import Bot, Dispatcher, executor, types
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-# from dotenv import load_dotenv  # можно вообще не использовать на Railway
+from aiogram.utils.exceptions import MessageNotModified, TelegramAPIError
+from dotenv import load_dotenv
 
-# Локально можешь оставить, но в проверке не упоминать .env
-# load_dotenv()
-
+# Загружаем токен из .env
+load_dotenv()
 API_TOKEN = os.getenv("BOT_TOKEN")
 if not API_TOKEN:
-    raise RuntimeError("Не найден BOT_TOKEN в переменных окружения")
-
+    raise RuntimeError("Не найден BOT_TOKEN в .env")
 
 # Confluence: раздел «ИБ в лицах» — название и ссылка (в .env: CONFLUENCE_IB_FACES_SECTION, CONFLUENCE_IB_FACES_URL)
 CONFLUENCE_IB_FACES_URL = os.getenv("CONFLUENCE_IB_FACES_URL", "").strip()
@@ -478,6 +479,28 @@ logging.basicConfig(level=logging.INFO)
 
 bot = Bot(token=API_TOKEN, parse_mode="HTML")
 dp = Dispatcher(bot)
+
+PENDING_ACCESS_TEXT = (
+    "Ваша заявка на доступ к боту рассматривается.\n\n"
+    "Когда доступ будет подтверждён, вы получите сообщение и сможете пользоваться "
+    "всеми разделами. Обычно это занимает немного времени."
+)
+
+
+async def _notify_admins_new_request(user: types.User) -> None:
+    safe_name = html.escape(user.full_name or "")
+    line = (
+        "Новая заявка на доступ к боту\n\n"
+        f"ID: <code>{user.id}</code>\n"
+        f"Имя: {safe_name}\n"
+        f"Username: @{user.username or '—'}\n\n"
+        f"Одобрить: <code>/approve {user.id}</code>"
+    )
+    for admin_id in access.admin_user_ids():
+        try:
+            await bot.send_message(admin_id, line, parse_mode="HTML")
+        except Exception:
+            logging.exception("Не удалось отправить уведомление админу %s", admin_id)
 
 
 DIALOG = {
@@ -1174,6 +1197,17 @@ def build_keyboard(node_key: str) -> InlineKeyboardMarkup:
 
 @dp.message_handler(commands=["start", "help"])
 async def cmd_start(message: types.Message):
+    uid = message.from_user.id
+    if access.access_gate_enabled() and not access.user_has_access(uid):
+        # Сначала ответ пользователю — чтобы заявка не «зависла», если уведомление админам упало
+        await message.answer(PENDING_ACCESS_TEXT)
+        try:
+            if access.register_pending(uid):
+                await _notify_admins_new_request(message.from_user)
+        except Exception:
+            logging.exception("Ошибка при регистрации заявки или уведомлении админов")
+        return
+
     node_key = "root"
     await message.answer(
         DIALOG[node_key]["text"],
@@ -1181,8 +1215,79 @@ async def cmd_start(message: types.Message):
     )
 
 
+@dp.message_handler(commands=["approve"])
+async def cmd_approve(message: types.Message):
+    if not access.is_admin(message.from_user.id):
+        return
+    parts = (message.text or "").split()
+    if len(parts) < 2 or not parts[1].isdigit():
+        await message.answer(
+            "Использование: <code>/approve &lt;user_id&gt;</code>",
+            parse_mode="HTML",
+        )
+        return
+    uid = int(parts[1])
+    if not access.approve_user(uid):
+        await message.answer(
+            f"Пользователь <code>{uid}</code> уже имеет доступ.",
+            parse_mode="HTML",
+        )
+        return
+    await message.answer(
+        f"Доступ выдан пользователю <code>{uid}</code>.",
+        parse_mode="HTML",
+    )
+    try:
+        await bot.send_message(
+            uid,
+            "Вам открыт доступ к боту. Нажмите /start, чтобы открыть меню.",
+        )
+    except Exception:
+        logging.exception("Не удалось уведомить пользователя %s", uid)
+
+
+@dp.message_handler(commands=["pending"])
+async def cmd_pending(message: types.Message):
+    if not access.is_admin(message.from_user.id):
+        return
+    pending = access.list_pending()
+    if not pending:
+        await message.answer("Ожидающих заявок нет.")
+        return
+    lines = "\n".join(f"<code>{pid}</code> — /approve {pid}" for pid in pending)
+    await message.answer("Ожидают доступа:\n" + lines, parse_mode="HTML")
+
+
+@dp.message_handler(commands=["revoke"])
+async def cmd_revoke(message: types.Message):
+    if not access.is_admin(message.from_user.id):
+        return
+    parts = (message.text or "").split()
+    if len(parts) < 2 or not parts[1].isdigit():
+        await message.answer(
+            "Использование: <code>/revoke &lt;user_id&gt;</code>",
+            parse_mode="HTML",
+        )
+        return
+    uid = int(parts[1])
+    if access.revoke_user(uid):
+        await message.answer(
+            f"Доступ у пользователя <code>{uid}</code> снят.",
+            parse_mode="HTML",
+        )
+    else:
+        await message.answer("Пользователь не был в списке одобренных или ожидающих.")
+
+
 @dp.callback_query_handler(lambda c: c.data and c.data.startswith("goto:"))
 async def process_goto(callback_query: types.CallbackQuery):
+    if access.access_gate_enabled() and not access.user_has_access(callback_query.from_user.id):
+        await callback_query.answer(
+            "Разделы станут доступны после одобрения заявки администратором.",
+            show_alert=True,
+        )
+        return
+
     target = callback_query.data.split(":", 1)[1]
 
     if target not in DIALOG:
@@ -1191,14 +1296,36 @@ async def process_goto(callback_query: types.CallbackQuery):
 
     node = DIALOG[target]
 
-    await bot.edit_message_text(
-        node["text"],
-        chat_id=callback_query.message.chat.id,
-        message_id=callback_query.message.message_id,
-        reply_markup=build_keyboard(target),
-    )
+    try:
+        await bot.edit_message_text(
+            node["text"],
+            chat_id=callback_query.message.chat.id,
+            message_id=callback_query.message.message_id,
+            reply_markup=build_keyboard(target),
+        )
+    except MessageNotModified:
+        # Тот же экран нажали повторно — Telegram не меняет сообщение
+        pass
+    except TelegramAPIError as e:
+        logging.exception("Telegram API при смене раздела: %s", e)
+        await callback_query.answer(
+            "Не удалось открыть раздел. Попробуйте /start.",
+            show_alert=True,
+        )
+        return
+
     await callback_query.answer()
 
 
+@dp.errors_handler()
+async def global_error_handler(update, exception):
+    """Логируем любую ошибку в обработчиках — иначе бот «молчит» без причины в консоли."""
+    logging.exception("Ошибка при обработке update: %s", exception)
+    return True
+
+
 if __name__ == "__main__":
+    warn = access.approval_config_warning()
+    if warn:
+        logging.warning(warn)
     executor.start_polling(dp, skip_updates=True)
